@@ -1,8 +1,14 @@
 
+import hashlib
 import json
+import platform
+import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import sklearn
+from sklearn.metrics import confusion_matrix
 
 from src.baseline_model import train_and_evaluate
 from src.data_loader import load_dataset
@@ -18,13 +24,24 @@ METRICS = (
 )
 
 
+def file_sha256(path):
+    """Return a SHA-256 checksum for the dataset file."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def run_experiment(
     data_path="data/ciphertexts.csv",
     output_dir="results",
     random_state=42,
 ):
-    """Compare models and analyze held-out predictions by text length."""
-    data = load_dataset(data_path)
+    """Compare models on identical source-separated test examples."""
+    data_file = Path(data_path)
+    data = load_dataset(data_file)
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -41,26 +58,42 @@ def run_experiment(
         random_state=random_state,
     )
 
-    baseline_sources = set(baseline["test_source_ids"])
-    fusion_sources = set(fusion["test_source_ids"])
+    # Ensure all models use identical source partitions.
+    for split in ("train", "validation", "test"):
+        key = f"{split}_source_ids"
+        if set(baseline[key]) != set(fusion[key]):
+            raise RuntimeError(
+                f"Baseline and fusion models used different "
+                f"{split} sources."
+            )
 
-    if baseline_sources != fusion_sources:
-        raise RuntimeError(
-            "Baseline and fusion models used different test sources."
-        )
+    # Ensure predictions correspond to identical test examples.
+    test_texts = baseline["test_ciphertexts"]
+    test_labels = baseline["test_labels"]
 
-    baseline_texts = baseline["test_ciphertexts"]
-    fusion_texts = fusion["test_ciphertexts"]
+    if test_texts != fusion["test_ciphertexts"]:
+        raise RuntimeError("Test ciphertexts do not match.")
 
-    if baseline_texts != fusion_texts:
-        raise RuntimeError(
-            "Baseline and fusion models used different test examples."
-        )
+    if test_labels != fusion["test_labels"]:
+        raise RuntimeError("Test labels do not match.")
 
-    if baseline["test_labels"] != fusion["test_labels"]:
-        raise RuntimeError(
-            "Baseline and fusion models used different test labels."
-        )
+    labels = list(baseline["class_labels"])
+    if labels != list(fusion["class_labels"]):
+        raise RuntimeError("Model class-label ordering does not match.")
+
+    predictions_by_model = {
+        "statistical_random_forest": baseline["test_predictions"],
+        "character_tfidf_logistic_regression": (
+            fusion["character_predictions"]
+        ),
+        "statistical_character_fusion": fusion["fusion_predictions"],
+    }
+
+    for name, predictions in predictions_by_model.items():
+        if len(predictions) != len(test_labels):
+            raise RuntimeError(
+                f"{name} returned a different number of predictions."
+            )
 
     rows = [
         {
@@ -83,23 +116,25 @@ def run_experiment(
         index=False,
     )
 
-    # Analyze every model on the same held-out examples.
+    # Calculate confusion matrices using one fixed label order.
+    confusion_matrices = {}
+    for name, predictions in predictions_by_model.items():
+        matrix = confusion_matrix(
+            test_labels,
+            predictions,
+            labels=labels,
+        )
+        confusion_matrices[name] = matrix.tolist()
+
+    # Evaluate every model on the same test ciphertexts.
     length_results = []
 
-    prediction_sets = {
-        "statistical_random_forest": baseline["test_predictions"],
-        "character_tfidf_logistic_regression": (
-            fusion["character_predictions"]
-        ),
-        "statistical_character_fusion": fusion["fusion_predictions"],
-    }
-
-    for model_name, predictions in prediction_sets.items():
+    for model_name, predictions in predictions_by_model.items():
         length_table = evaluate_by_ciphertext_length(
-            ciphertexts=baseline_texts,
-            y_true=baseline["test_labels"],
+            ciphertexts=test_texts,
+            y_true=test_labels,
             y_pred=predictions,
-            labels=baseline["class_labels"],
+            labels=labels,
         )
         length_table.insert(0, "model", model_name)
         length_results.append(length_table)
@@ -114,12 +149,26 @@ def run_experiment(
     )
 
     report = {
-        "dataset": str(data_path),
+        "dataset_path": str(data_file),
+        "dataset_sha256": file_sha256(data_file),
         "random_state": random_state,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "numpy_version": np.__version__,
+        "pandas_version": pd.__version__,
+        "scikit_learn_version": sklearn.__version__,
         "sample_count": len(data),
         "class_count": int(data["label"].nunique()),
         "source_count": int(data["source_id"].nunique()),
-        "test_source_count": len(baseline_sources),
+        "train_source_count": len(
+            set(baseline["train_source_ids"])
+        ),
+        "validation_source_count": len(
+            set(baseline["validation_source_ids"])
+        ),
+        "test_source_count": len(
+            set(baseline["test_source_ids"])
+        ),
         "fusion_statistical_weight": fusion[
             "fusion_weight_statistical"
         ],
@@ -127,11 +176,11 @@ def run_experiment(
             "validation_macro_f1"
         ],
         "results": rows,
-        "length_results": length_comparison.to_dict(orient="records"),
-        "class_labels": baseline["class_labels"],
-        "baseline_confusion_matrix": baseline[
-            "confusion_matrix"
-        ].tolist(),
+        "confusion_matrices": confusion_matrices,
+        "length_results": length_comparison.to_dict(
+            orient="records"
+        ),
+        "class_labels": labels,
     }
 
     with (output_path / "experiment_report.json").open(
