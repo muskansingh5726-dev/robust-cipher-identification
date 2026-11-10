@@ -10,6 +10,7 @@ venv/
 
 # Test and tooling caches
 .pytest_cache/
+.pytest-run/
 .mypy_cache/
 .ruff_cache/
 
@@ -20,3 +21,8 @@ venv/
 # Generated research artifacts
 results/
 models/
+data/sources/
+data/source_metadata.csv
+data/ciphertexts.csv
+data/source_manifest.csv
+data/dataset_manifest.json
