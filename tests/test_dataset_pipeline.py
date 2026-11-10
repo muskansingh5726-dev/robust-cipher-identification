@@ -12,6 +12,7 @@ from src.dataset_pipeline import (
     build_dataset,
     encrypt_atbash,
     stable_source_id,
+    _strip_gutenberg_boilerplate,
 )
 from src.data_splitting import split_by_source
 
@@ -41,6 +42,17 @@ def test_source_id_is_stable_and_atbash_is_defined():
     assert key["mapping"] == "A<->Z"
 
 
+def test_gutenberg_boilerplate_is_removed_only_when_both_markers_exist():
+    wrapped = (
+        "header *** START OF THE PROJECT GUTENBERG EBOOK Sample *** "
+        "Actual book text. *** END OF THE PROJECT GUTENBERG EBOOK Sample *** footer"
+    )
+    assert _strip_gutenberg_boilerplate(wrapped) == " Actual book text. "
+    assert _strip_gutenberg_boilerplate("ordinary text without markers") == (
+        "ordinary text without markers"
+    )
+
+
 def test_all_supported_encryptors_preserve_letters_and_length():
     plaintext = "THISISALONGERPLAINTEXTFORTESTING"
     for cipher in CIPHER_NAMES:
@@ -64,18 +76,34 @@ def test_dataset_generation_is_reproducible_and_records_provenance(tmp_path):
             "source_url": ["https://example.test/source"] * len(filenames),
             "license": ["CC0-1.0"] * len(filenames),
             "retrieved_at": ["2026-01-01"] * len(filenames),
+            "download_url": ["https://example.test/source.txt"] * len(filenames),
+            "publication_year": ["1900"] * len(filenames),
+            "author_death_year": ["1950"] * len(filenames),
+            "terms_url": ["https://example.test/terms"] * len(filenames),
         }
     ).to_csv(metadata_path, index=False)
     first, first_manifest = build_dataset(
-        source_dir, tmp_path / "one" / "ciphertexts.csv", 23, metadata_path
+        source_dir,
+        tmp_path / "one" / "ciphertexts.csv",
+        23,
+        metadata_path,
+        sample_lengths=(20, 60, 80),
+        samples_per_length=2,
     )
     second, second_manifest = build_dataset(
-        source_dir, tmp_path / "two" / "ciphertexts.csv", 23, metadata_path
+        source_dir,
+        tmp_path / "two" / "ciphertexts.csv",
+        23,
+        metadata_path,
+        sample_lengths=(20, 60, 80),
+        samples_per_length=2,
     )
     pd.testing.assert_frame_equal(first, second)
     assert first_manifest["dataset_sha256"] == second_manifest["dataset_sha256"]
-    assert len(first) == len(filenames) * len(CIPHER_NAMES)
-    assert {"source_sha256", "source_url", "license", "partition"} <= set(first.columns)
+    assert len(first) == len(filenames) * 6 * len(CIPHER_NAMES)
+    assert {"source_sha256", "source_url", "license", "partition", "sample_index"} <= set(first.columns)
+    assert first["author_death_year"].eq("1950").all()
+    assert first["download_url"].eq("https://example.test/source.txt").all()
     assert "plaintext" not in first.columns
     assert first_manifest["ciphers"]["beaufort"]["variant"].startswith("standard Beaufort")
 
@@ -85,6 +113,8 @@ def test_dataset_generation_is_reproducible_and_records_provenance(tmp_path):
         (tmp_path / "one" / "dataset_manifest.json").read_text(encoding="utf-8")
     )
     assert saved_manifest["quality_checks"]["all_sources_isolated"] is True
+    assert saved_manifest["quality_checks"]["plaintext_window_count"] == len(filenames) * 6
+    assert set(saved_manifest["quality_checks"]["length_group_counts"]) == {"short", "medium"}
 
 
 def test_source_partitions_are_reproducible_and_complete():

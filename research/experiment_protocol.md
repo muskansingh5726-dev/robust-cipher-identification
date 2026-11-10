@@ -115,8 +115,13 @@ sourced and documented test corpus.
 
 ## 11. Current Status
 
-- Software unit tests: 20 passing in the latest reported run.
-- Real dataset validation: pending.
-- Experimental comparison on real data: pending.
-- Performance improvement: not yet established.
-- Research novelty: not yet established.
+- Software unit tests: 34 passing in the latest run.
+- Dataset validation: completed for a 32-book Project Gutenberg source catalog;
+  generated ciphertext is synthetic.
+- Three source-level split-seed pilot runs are recorded in
+  `research/real_corpus_pilot.md`.
+- Fusion had the highest test macro F1 on all three synthetic splits; this is
+  provisional evidence limited to this corpus and cipher-generation setup.
+- Historical-ciphertext performance and research novelty remain
+  unestablished. An independently sourced, labeled historical test corpus and
+  further related-work review are still needed.

@@ -53,4 +53,6 @@ def test_baseline_trains_and_returns_metrics():
     assert 0 <= results["macro_recall"] <= 1
     assert 0 <= results["macro_f1"] <= 1
     assert set(results["class_labels"]) == {"caesar", "atbash"}
+    assert len(results["train_source_ids"]) > 0
+    assert len(results["validation_source_ids"]) > 0
     assert len(results["test_source_ids"]) > 0

@@ -44,7 +44,9 @@ CIPHER_KEY_RULES = {
     ),
 }
 PARTITIONS = ("train", "validation", "test")
-PROVENANCE_COLUMNS = (
+DEFAULT_SAMPLE_LENGTHS = (40, 100, 200)
+DEFAULT_SAMPLES_PER_LENGTH = 10
+REQUIRED_METADATA_COLUMNS = (
     "filename",
     "title",
     "author",
@@ -52,6 +54,13 @@ PROVENANCE_COLUMNS = (
     "license",
     "retrieved_at",
 )
+OPTIONAL_METADATA_COLUMNS = (
+    "download_url",
+    "publication_year",
+    "author_death_year",
+    "terms_url",
+)
+PROVENANCE_COLUMNS = REQUIRED_METADATA_COLUMNS + OPTIONAL_METADATA_COLUMNS
 
 
 def normalize_plaintext(text: str) -> str:
@@ -64,8 +73,12 @@ def stable_source_id(normalized_text: str) -> str:
     return "src_" + hashlib.sha256(normalized_text.encode("ascii")).hexdigest()
 
 
-def _derive_rng(seed: int, source_id: str, cipher: str) -> random.Random:
-    token = f"{seed}\0{source_id}\0{cipher}\0{PIPELINE_VERSION}".encode()
+def _derive_rng(
+    seed: int, source_id: str, cipher: str, sample_index: int
+) -> random.Random:
+    token = (
+        f"{seed}\0{source_id}\0{cipher}\0{sample_index}\0{PIPELINE_VERSION}"
+    ).encode()
     derived = int.from_bytes(hashlib.sha256(token).digest()[:8], "big")
     return random.Random(derived)
 
@@ -200,9 +213,74 @@ def assign_source_partitions(
     return result
 
 
-def validate_dataset(data: pd.DataFrame, sources: pd.DataFrame) -> dict:
+def _make_segments(
+    normalized_text: str,
+    sample_lengths: tuple[int, ...],
+    samples_per_length: int,
+) -> list[tuple[int, int, str]]:
+    """Select evenly spaced, fixed-length windows from one source document."""
+    if not sample_lengths or any(length < 1 for length in sample_lengths):
+        raise ValueError("Sample lengths must be positive integers.")
+    if len(set(sample_lengths)) != len(sample_lengths):
+        raise ValueError("Sample lengths must be unique.")
+    if samples_per_length < 1:
+        raise ValueError("Samples per length must be positive.")
+    if len(normalized_text) < max(sample_lengths):
+        raise ValueError(
+            f"Source has {len(normalized_text)} letters but needs at least "
+            f"{max(sample_lengths)} for the requested sample lengths."
+        )
+
+    segments = []
+    sample_index = 0
+    for length in sample_lengths:
+        last_start = len(normalized_text) - length
+        for occurrence in range(samples_per_length):
+            if samples_per_length == 1:
+                start = last_start // 2
+            else:
+                start = round(
+                    occurrence * last_start / (samples_per_length - 1)
+                )
+            segments.append(
+                (sample_index, length, normalized_text[start : start + length])
+            )
+            sample_index += 1
+    return segments
+
+
+def _strip_gutenberg_boilerplate(text: str) -> str:
+    """Remove standard Project Gutenberg header/footer when both markers exist."""
+    start_pattern = re.compile(
+        r"\*\*\*\s*START OF (?:THE|THIS) PROJECT GUTENBERG.*?\*\*\*",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    end_pattern = re.compile(
+        r"\*\*\*\s*END OF (?:THE|THIS) PROJECT GUTENBERG.*?\*\*\*",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    start = start_pattern.search(text)
+    end = end_pattern.search(text)
+    if start and end and end.start() > start.end():
+        return text[start.end() : end.start()]
+    return text
+
+
+def validate_dataset(
+    data: pd.DataFrame,
+    sources: pd.DataFrame,
+    expected_samples_per_source: int,
+) -> dict:
     """Check schema, labels, source isolation, duplicates, and row completeness."""
-    required = {"ciphertext", "label", "source_id", "partition", "sample_id"}
+    required = {
+        "ciphertext",
+        "label",
+        "source_id",
+        "partition",
+        "sample_id",
+        "sample_index",
+        "length_group",
+    }
     missing = required - set(data.columns)
     if missing:
         raise ValueError(f"Generated data is missing columns: {sorted(missing)}")
@@ -231,9 +309,19 @@ def validate_dataset(data: pd.DataFrame, sources: pd.DataFrame) -> dict:
         observed_partitions.reindex(expected_partitions.index).sort_index()
     ):
         raise ValueError("Generated rows do not match source-manifest partitions.")
-    expected = len(sources) * len(CIPHER_NAMES)
+    expected = (
+        len(sources) * expected_samples_per_source * len(CIPHER_NAMES)
+    )
     if len(data) != expected:
         raise ValueError(f"Expected {expected} variants but generated {len(data)}.")
+    sample_counts = data.groupby("source_id")["sample_index"].nunique()
+    if sample_counts.ne(expected_samples_per_source).any():
+        raise ValueError("Sources have inconsistent sample-window counts.")
+    variants_per_sample = data.groupby(
+        ["source_id", "sample_index"]
+    )["label"].nunique()
+    if variants_per_sample.ne(len(CIPHER_NAMES)).any():
+        raise ValueError("Every source window must have one variant per cipher.")
     counts = data.groupby(["partition", "label"]).size().unstack(fill_value=0)
     if (counts == 0).any().any():
         raise ValueError("Every cipher label must occur in every partition.")
@@ -245,6 +333,7 @@ def validate_dataset(data: pd.DataFrame, sources: pd.DataFrame) -> dict:
     return {
         "sample_count": int(len(data)),
         "source_count": int(len(sources)),
+        "plaintext_window_count": int(len(sources) * expected_samples_per_source),
         "class_counts": {str(key): int(value) for key, value in data["label"].value_counts().items()},
         "partition_class_counts": {
             str(partition): {
@@ -262,22 +351,31 @@ def validate_dataset(data: pd.DataFrame, sources: pd.DataFrame) -> dict:
             "median": float(data["text_length"].median()),
             "max": int(data["text_length"].max()),
         },
+        "length_group_counts": {
+            str(key): int(value)
+            for key, value in data["length_group"].value_counts().items()
+        },
         "exact_duplicate_ciphertext_rows": duplicate_ciphertexts,
         "sources_missing_title_or_license": provenance_incomplete,
         "all_sources_isolated": True,
     }
 
 
-def _read_sources(source_dir: Path, metadata_path: Path | None) -> tuple[pd.DataFrame, list[str]]:
+def _read_sources(
+    source_dir: Path, metadata_path: Path | None
+) -> tuple[pd.DataFrame, list[str]]:
     files = sorted(path for path in source_dir.rglob("*.txt") if path.is_file())
     if not files:
         raise ValueError(f"No .txt source documents found in {source_dir}.")
     metadata = pd.DataFrame(columns=PROVENANCE_COLUMNS)
     if metadata_path is not None:
         metadata = pd.read_csv(metadata_path, dtype="string").fillna("")
-        missing = set(PROVENANCE_COLUMNS) - set(metadata.columns)
+        missing = set(REQUIRED_METADATA_COLUMNS) - set(metadata.columns)
         if missing:
             raise ValueError(f"Metadata is missing columns: {sorted(missing)}")
+        for column in OPTIONAL_METADATA_COLUMNS:
+            if column not in metadata.columns:
+                metadata[column] = ""
         if metadata["filename"].duplicated().any():
             raise ValueError("Metadata filenames must be unique.")
         metadata = metadata.set_index("filename")
@@ -285,7 +383,9 @@ def _read_sources(source_dir: Path, metadata_path: Path | None) -> tuple[pd.Data
     for path in files:
         relative = path.relative_to(source_dir).as_posix()
         raw_bytes = path.read_bytes()
-        raw_text = raw_bytes.decode("utf-8-sig")
+        raw_text = _strip_gutenberg_boilerplate(
+            raw_bytes.decode("utf-8-sig")
+        )
         normalized = normalize_plaintext(raw_text)
         if len(normalized) < 20:
             raise ValueError(f"Source has fewer than 20 A-Z letters: {relative}")
@@ -296,12 +396,10 @@ def _read_sources(source_dir: Path, metadata_path: Path | None) -> tuple[pd.Data
         details = metadata.loc[relative].to_dict() if relative in metadata.index else {}
         rows.append({
             "source_id": source_id,
+            **{column: details.get(column, "") for column in PROVENANCE_COLUMNS},
+            # filename is the actual relative path observed on disk, even though
+            # it is also a metadata key used to join provenance.
             "filename": relative,
-            "title": details.get("title", ""),
-            "author": details.get("author", ""),
-            "source_url": details.get("source_url", ""),
-            "license": details.get("license", ""),
-            "retrieved_at": details.get("retrieved_at", ""),
             "source_sha256": hashlib.sha256(raw_bytes).hexdigest(),
             "normalized_character_count": len(normalized),
         })
@@ -318,6 +416,8 @@ def build_dataset(
     output_csv: str | Path,
     seed: int = 42,
     metadata_csv: str | Path | None = None,
+    sample_lengths: tuple[int, ...] = DEFAULT_SAMPLE_LENGTHS,
+    samples_per_length: int = DEFAULT_SAMPLES_PER_LENGTH,
 ) -> tuple[pd.DataFrame, dict]:
     """Create dataset CSV and manifests from a directory of UTF-8 text files."""
     source_dir = Path(source_dir)
@@ -330,27 +430,50 @@ def build_dataset(
     # This assignment happens before the loop that creates any ciphertext.
     sources = assign_source_partitions(sources, seed)
     rows = []
+    expected_samples_per_source = len(sample_lengths) * samples_per_length
     for source, plaintext in zip(sources.to_dict("records"), plaintexts):
-        for label, encryptor in ENCRYPTORS.items():
-            ciphertext, key_spec = encryptor(
-                plaintext, _derive_rng(seed, source["source_id"], label)
-            )
-            sample_id = hashlib.sha256(
-                f"{source['source_id']}\0{label}\0{json.dumps(key_spec, sort_keys=True)}".encode()
+        segments = _make_segments(
+            plaintext, tuple(sample_lengths), samples_per_length
+        )
+        for sample_index, sample_length, sample_text in segments:
+            sample_digest = hashlib.sha256(
+                sample_text.encode("ascii")
             ).hexdigest()
-            rows.append({
-                "sample_id": sample_id,
-                "ciphertext": ciphertext,
-                "label": label,
-                "source_id": source["source_id"],
-                "partition": source["partition"],
-                "text_length": len(ciphertext),
-                "key_spec": json.dumps(key_spec, sort_keys=True),
-                **{column: source[column] for column in PROVENANCE_COLUMNS},
-                "source_sha256": source["source_sha256"],
-            })
+            length_group = (
+                "short"
+                if sample_length <= 50
+                else "medium"
+                if sample_length <= 150
+                else "long"
+            )
+            for label, encryptor in ENCRYPTORS.items():
+                ciphertext, key_spec = encryptor(
+                    sample_text,
+                    _derive_rng(
+                        seed, source["source_id"], label, sample_index
+                    ),
+                )
+                sample_id = hashlib.sha256(
+                    f"{source['source_id']}\0{sample_index}\0{label}\0{sample_digest}".encode()
+                ).hexdigest()
+                rows.append({
+                    "sample_id": sample_id,
+                    "ciphertext": ciphertext,
+                    "label": label,
+                    "source_id": source["source_id"],
+                    "partition": source["partition"],
+                    "sample_index": sample_index,
+                    "sample_length": sample_length,
+                    "length_group": length_group,
+                    "text_length": len(ciphertext),
+                    "key_spec": json.dumps(key_spec, sort_keys=True),
+                    **{column: source[column] for column in PROVENANCE_COLUMNS},
+                    "source_sha256": source["source_sha256"],
+                })
     data = pd.DataFrame(rows)
-    summary = validate_dataset(data, sources)
+    summary = validate_dataset(
+        data, sources, expected_samples_per_source
+    )
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     data.to_csv(output_csv, index=False)
     source_manifest_path = output_csv.with_name("source_manifest.csv")
@@ -363,9 +486,16 @@ def build_dataset(
         "input_directory": str(source_dir),
         "input_metadata_csv": str(metadata_csv) if metadata_csv else None,
         "normalization": "uppercase; retain ASCII A-Z only; no plaintext is emitted",
+        "windowing": {
+            "method": "evenly spaced contiguous windows from normalized source text",
+            "sample_lengths": list(sample_lengths),
+            "samples_per_length_per_source": samples_per_length,
+            "sample_order": "lengths in configured order, then occurrence order",
+            "gutenberg_boilerplate": "removed when standard start and end markers are both present",
+        },
         "source_id": "src_ plus SHA-256 of normalized A-Z plaintext",
         "partitioning": {
-            "method": "GroupShuffleSplit on unique source IDs before encryption",
+            "method": "GroupShuffleSplit on unique source-document IDs before windowing or encryption",
             "fractions_approximate": {"train": 0.60, "validation": 0.20, "test": 0.20},
             "seed": seed,
         },
@@ -409,8 +539,28 @@ def main() -> None:
     parser.add_argument("--metadata-csv", help="Optional CSV with filename,title,author,source_url,license,retrieved_at.")
     parser.add_argument("--output", default="data/ciphertexts.csv", help="Output canonical dataset CSV.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sample-lengths",
+        nargs="+",
+        type=int,
+        default=list(DEFAULT_SAMPLE_LENGTHS),
+        help="Alphabetic window lengths; defaults cover short, medium, and long bins.",
+    )
+    parser.add_argument(
+        "--samples-per-length",
+        type=int,
+        default=DEFAULT_SAMPLES_PER_LENGTH,
+        help="Number of evenly spaced windows per configured length and source.",
+    )
     args = parser.parse_args()
-    data, manifest = build_dataset(args.sources_dir, args.output, args.seed, args.metadata_csv)
+    data, manifest = build_dataset(
+        args.sources_dir,
+        args.output,
+        args.seed,
+        args.metadata_csv,
+        tuple(args.sample_lengths),
+        args.samples_per_length,
+    )
     print(f"Generated {len(data)} rows from {manifest['quality_checks']['source_count']} sources.")
     print(f"Dataset: {Path(args.output).resolve()}")
     print(f"Manifest: {Path(args.output).with_name('dataset_manifest.json').resolve()}")

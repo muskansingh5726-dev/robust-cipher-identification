@@ -98,6 +98,8 @@ def train_and_evaluate(
         ),
         "class_labels": labels,
         "model": model,
+        "train_source_ids": train["source_id"].tolist(),
+        "validation_source_ids": validation["source_id"].tolist(),
         "test_source_ids": test["source_id"].tolist(),
         "test_ciphertexts": test["ciphertext"].tolist(),
         "test_labels": y_test.tolist(),

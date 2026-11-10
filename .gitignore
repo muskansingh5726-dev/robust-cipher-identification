@@ -22,7 +22,9 @@ venv/
 results/
 models/
 data/sources/
-data/source_metadata.csv
+data/demo_sources/
+data/demo_source_metadata.csv
+data/pilot-seed*/
 data/ciphertexts.csv
 data/source_manifest.csv
 data/dataset_manifest.json
