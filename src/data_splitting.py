@@ -24,6 +24,35 @@ def split_by_source(data, random_state=42):
     if data[list(required)].isna().any().any():
         raise ValueError("Required fields cannot be missing.")
 
+    # Dataset-generation pipelines may assign source partitions before
+    # producing cipher variants. Preserve those assignments so training does
+    # not silently re-split the generated examples.
+    if "partition" in data.columns:
+        partition = data["partition"].astype("string").str.strip().str.lower()
+        allowed = {"train", "validation", "test"}
+        if partition.isna().any() or not set(partition).issubset(allowed):
+            raise ValueError(
+                "Preassigned partitions must be train, validation, or test."
+            )
+        if set(partition) != allowed:
+            raise ValueError(
+                "Preassigned data must contain train, validation, and test."
+            )
+        source_partitions = pd.DataFrame({
+            "source_id": data["source_id"].astype(str),
+            "partition": partition,
+        }).groupby("source_id")["partition"].nunique()
+        if source_partitions.gt(1).any():
+            raise ValueError(
+                "A source_id is assigned to more than one partition."
+            )
+        train = data.loc[partition.eq("train")].copy()
+        validation = data.loc[partition.eq("validation")].copy()
+        test = data.loc[partition.eq("test")].copy()
+        if any(frame.empty for frame in (train, validation, test)):
+            raise ValueError("Preassigned partitions cannot be empty.")
+        return train, validation, test
+
     source_counts = data["source_id"].nunique()
 
     if source_counts < 5:

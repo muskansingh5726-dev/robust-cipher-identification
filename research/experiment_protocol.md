@@ -96,7 +96,24 @@ Do not compare results directly with published accuracy unless dataset, cipher c
 
 Treat the proposed research contribution as provisional until the related-work review establishes a defensible research gap.
 
-## 10. Current Status
+## 10. Dataset Generation and Scope
+
+src.dataset_pipeline creates one deterministic ciphertext variant per source
+for each of eight supported classical ciphers. A source_id is derived from the
+SHA-256 hash of normalized A-Z plaintext. The source manifest records the
+original file hash and citation/license fields when provided.
+
+Source partitions are assigned before encryption and saved in the partition
+column. The model splitter honors those assignments, preventing variants of
+one plaintext source from crossing train, validation, and test. The generator
+also records keys and its seed for reproducibility.
+
+Generated examples are synthetic. They measure performance under the
+documented generation setup but do not demonstrate generalization to historical
+ciphertext. Any historical evaluation requires a separate, independently
+sourced and documented test corpus.
+
+## 11. Current Status
 
 - Software unit tests: 20 passing in the latest reported run.
 - Real dataset validation: pending.
